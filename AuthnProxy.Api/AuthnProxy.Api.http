@@ -1,0 +1,6 @@
+@AuthnProxy.Api_HostAddress = http://localhost:65000
+
+GET {{AuthnProxy.Api_HostAddress}}/ping
+Accept: application/json
+
+###

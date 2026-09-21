@@ -1,0 +1,7 @@
+[tools]
+dotnet = "10.0.401"
+
+[tasks]
+format = { run = "dotnet format" }
+build = { run = "dotnet build" }
+test = { run = "dotnet test" }

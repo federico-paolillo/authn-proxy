@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="AuthnProxy.Application/AuthnProxy.Application.csproj" />
+  <Project Path="AuthnProxy.Api/AuthnProxy.Api.csproj" />
+  <Project Path="AuthnProxy.Tests.Integration/AuthnProxy.Tests.Integration.csproj" />
+  <Project Path="AuthnProxy.Tests.Unit/AuthnProxy.Tests.Unit.csproj" />
+</Solution>
