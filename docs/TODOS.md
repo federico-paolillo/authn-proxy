@@ -1,0 +1,263 @@
+# OIDC authentication proxy implementation todos
+
+Execute these slices in order. A slice is complete only when its listed tests
+and validation pass; later slices may extend an earlier test fixture but should
+not duplicate its assertions.
+
+## 0. Assess the example inputs (completed during planning)
+
+- [x] Locate `SsoExtensions` in `examples/ssoTokenExtension.txt` and
+  `SsoTokenRefresher` in the misspelled `examples/ssoTockenRefresher.txt`.
+- [x] Review every material setup and refresh mechanism for .NET 10 API,
+  security, provider-neutrality, cache, cancellation, and failure-policy fit.
+- [x] Record precise adopt/adapt/reject findings and target concerns in
+  `docs/PLAN.md`.
+- [x] Confirm the cited ASP.NET Core refresh-token feature request remains open,
+  so a cohesive application refresher is still required for .NET 10.
+
+Implementation rule: use the examples as design input only. Do not copy either
+file wholesale; the plan identifies the small set of mechanisms worth adapting.
+
+## 1. Establish dependencies and configuration contracts
+
+- [ ] Add the official ASP.NET Core OpenID Connect package aligned with the
+  repository's 10.0.x dependency versions; add no provider SDK.
+- [ ] Define provider-neutral options for authority/client credentials, fixed
+  paths, scopes, claim mapping, client authentication method, session/refresh/
+  transaction lifetimes, and cookie settings.
+- [ ] Implement startup validation, including production HTTPS, `__Host-`
+  cookie rules, relative local redirects, required secrets, and coherent
+  lifetimes.
+- [ ] Register `AddDistributedMemoryCache`, data protection, and
+  `TimeProvider.System` through a concern-specific authentication extension.
+- [ ] Unit-test the validation rules without repeating framework validation.
+
+Completion gate: valid configuration starts; each material unsafe or incomplete
+configuration fails at startup with a secret-free diagnostic.
+
+## 2. Add local certificates and containerized Keycloak
+
+- [ ] Add the idempotent OpenSSL certificate script and gitignore all generated
+  CA, key, certificate, PFX, and password artifacts.
+- [ ] Generate localhost/service SANs, restrictive private-key permissions, and
+  output formats needed by Kestrel and Keycloak; never modify the system/browser
+  trust store.
+- [ ] Add a multi-stage .NET 10 image using a non-root chiseled runtime and make
+  it compatible with a read-only root filesystem.
+- [ ] Add Compose services for the API and a pinned Keycloak release, publishing
+  only `127.0.0.1:65100` and `127.0.0.1:65101`.
+- [ ] Share the service network namespace (or an equally safe verified design)
+  so browser, discovery, token exchange, and Keycloak back-channel logout use
+  the same localhost HTTPS authorities without host changes.
+- [ ] Add an importable realm with a confidential client, exact URIs, standard
+  code flow, PKCE S256, offline access, back-channel logout, and an ID-token
+  roles mapper. Disable implicit/direct grants, service accounts, wildcard
+  redirects, and broad origins.
+- [ ] Keep bootstrap/client/user credentials external and development-only.
+- [ ] Change launch settings and `.http` requests from port 65000 to HTTPS 65100.
+
+Completion gate: `docker compose config` and image builds pass, OpenSSL inspection
+proves the expected SAN/expiry properties, and Keycloak's native import path
+accepts the realm. All published ports are explicitly loopback-bound.
+
+## 3. Store pending login transactions server-side
+
+- [ ] Implement the cache-backed
+  `ISecureDataFormat<AuthenticationProperties>` with 256-bit random handles,
+  purpose-specific data protection, and short absolute expiration.
+- [ ] Consume state on callback and reject missing, malformed, expired,
+  tampered, or reused handles.
+- [ ] Configure it as `OpenIdConnectOptions.StateDataFormat` without replacing
+  framework nonce or correlation validation.
+- [ ] Unit-test state round trip, one-time use, expiry, tampering, and cache
+  isolation by data-protection purpose.
+
+Completion gate: browser-visible state contains no serialized authentication
+properties and only a live server cache entry can complete the flow.
+
+## 4. Implement the distributed session ticket store
+
+- [ ] Implement all .NET 10 `ITicketStore` operations with cancellation and an
+  injected `IDistributedCache`.
+- [ ] Generate opaque 256-bit session IDs, use versioned hashed cache keys,
+  serialize with the framework ticket serializer, and data-protect cached
+  ticket bytes.
+- [ ] Apply bounded ticket/idle expiry and make renewal update the authoritative
+  server record.
+- [ ] Add issuer+`sid` and issuer+`sub` indexes with hashed key material, bounded
+  expiry, cleanup on removal, and lazy pruning of stale session IDs.
+- [ ] Keep read/modify/write races simple; add no distributed lock.
+- [ ] Post-configure the cookie scheme's `SessionStore` with the injected store.
+- [ ] Unit-test store/retrieve/renew/remove, corrupt/expired records, index
+  lifecycle, and stale index cleanup.
+
+Completion gate: an `AuthenticationTicket` containing known fake tokens round
+trips through the cache, while its corresponding cookie/reference and cache key
+contain none of those token values.
+
+## 5. Configure cookie and OpenID Connect handlers
+
+- [ ] Configure cookie authentication as the default authenticate/sign-in
+  scheme and make API challenges return 401/403 rather than login redirects.
+- [ ] Set `__Host-authn-proxy`, Secure, HttpOnly, host-only, `Path=/`, and Lax
+  SameSite cookie properties.
+- [ ] Configure OIDC code flow, PKCE, discovery, HTTPS metadata, saved server-side
+  tokens, `form_post` response mode, disabled UserInfo, explicit claim types,
+  and provider-neutral PAR behavior.
+- [ ] Configure Secure, HttpOnly, host-only, `SameSite=None` nonce/correlation
+  cookies and retain the handler's built-in issuer, audience, signature, state,
+  nonce, and correlation checks.
+- [ ] Add only `openid offline_access` by default; allow reviewed extra scopes
+  through configuration.
+- [ ] Add integration coverage for registration, challenge parameters, cookie
+  flags, and tampered/absent correlation.
+
+Completion gate: the framework completes a test-issuer code/PKCE callback into a
+server-side ticket, and a request without that cache record authenticates as
+anonymous.
+
+## 6. Add login and session introspection endpoints
+
+- [ ] Map `GET /login` to an explicit OIDC challenge with the single configured
+  post-login destination and no return-url input.
+- [ ] Map `GET /whoami` to 401 for no/expired session and an allowlisted response
+  for an authenticated session.
+- [ ] Return only subject, optional display name, and normalized roles; never
+  serialize the principal wholesale or expose authentication properties.
+- [ ] Keep callback routes owned by the OIDC handler.
+- [ ] Add endpoint integration tests for status codes, fixed redirects, response
+  shape, and absence of all fake token values.
+
+Completion gate: the primary flow reaches `/whoami` successfully after callback,
+and all browser-facing bodies, headers, and cookies remain token-free.
+
+## 7. Normalize ID-token roles without authorization
+
+- [ ] Require `sub` and build identity exclusively from the validated ID-token
+  principal.
+- [ ] Normalize a configured string/string-array role claim and a configured
+  object-key role claim into repeated role claims.
+- [ ] Configure the Keycloak realm to emit the simple array claim and document
+  the production ZITADEL claim name/value-shape settings in application
+  configuration examples.
+- [ ] Keep malformed values out of the principal with one aggregate, secret-free
+  diagnostic.
+- [ ] Add no role policies, authorization handlers, or role-gated endpoints.
+- [ ] Unit-test both provider claim shapes and malformed/empty inputs.
+
+Completion gate: `ClaimsPrincipal.IsInRole` and `/whoami` reflect ID-token roles
+for both provider fixtures while an opaque JWT-looking access token has no
+effect on identity.
+
+## 8. Implement token refresh
+
+- [ ] Add an OIDC cookie validation event and a cohesive token refresher using
+  current discovery metadata and the configured standard client authentication
+  method.
+- [ ] Decide refresh from saved `expires_at`; never decode the access or refresh
+  token.
+- [ ] Send the refresh grant with cancellation, handle protocol/network errors,
+  and preserve exception causes.
+- [ ] Save new access token/expiry, retain or rotate the refresh token correctly,
+  and renew the server ticket.
+- [ ] Validate a returned ID token with current issuer/signing/audience/lifetime
+  rules before replacing the principal; retain the prior ID-token principal if
+  the response legitimately omits an ID token.
+- [ ] Reject/delete on `invalid_grant`, invalid protocol data, invalid ID token,
+  or expired access token that cannot be refreshed; retain a still-usable ticket
+  on transient failure.
+- [ ] Do not add refresh locking or single-flight behavior.
+- [ ] Unit-test the complete decision/failure matrix with fixed time, opaque
+  tokens, rotated tokens, and locally signed ID tokens.
+
+Completion gate: refresh changes only the server ticket, never a browser-visible
+contract, and every session-retention/removal outcome matches the plan.
+
+## 9. Implement user-initiated logout
+
+- [ ] Map authenticated `POST /logout`; do not add a logout GET.
+- [ ] Sign out both cookie and OIDC schemes, delete the authoritative ticket and
+  indexes, and use only the fixed local post-logout path.
+- [ ] Let the OIDC handler use discovery and the saved server-side ID token hint;
+  never build a provider URL or send the hint to frontend code.
+- [ ] Fall back to local-only logout when the provider has no advertised
+  end-session endpoint.
+- [ ] Integration-test local deletion, OIDC sign-out parameters, fixed redirect,
+  absent-endpoint fallback, and token non-disclosure.
+
+Completion gate: the prior cookie can no longer resolve a ticket, and supported
+providers receive a standards-based RP-initiated logout request with the hint.
+
+## 10. Implement OpenID Connect back-channel logout
+
+- [ ] Add a form-only POST endpoint for `logout_token` with `Cache-Control:
+  no-store` responses.
+- [ ] Validate signature/algorithm, issuer, client audience, `iat`, `exp`, `jti`,
+  logout event, `sid`/`sub`, and prohibited `nonce` using current OIDC metadata.
+- [ ] Accept typed and untyped valid logout tokens for provider compatibility,
+  while rejecting `alg=none` and all invalid required claims.
+- [ ] Add hashed `(issuer,jti)` replay entries bounded by token expiry.
+- [ ] Invalidate the exact issuer+`sid` sessions, or all issuer+`sub` sessions
+  when `sid` is absent; treat no matching live session as success.
+- [ ] Return 200 on success and 400 on invalid request without leaking validation
+  details.
+- [ ] Unit-test every normative validation rule and session-selection policy;
+  integration-test form binding, cache invalidation, replay, and response
+  semantics.
+
+Completion gate: Keycloak- and ZITADEL-shaped valid logout tokens remove the
+intended server ticket(s), and invalid/replayed tokens cannot affect sessions.
+
+## 11. Add flow-oriented safe logging
+
+- [ ] Define source-generated events for login, callback, session lifecycle,
+  refresh outcomes, local logout, and back-channel acceptance/rejection.
+- [ ] Retain the generic host's console logging provider, use `ILogger<T>` only,
+  and control verbosity through the existing `Logging` configuration.
+- [ ] Use generated flow IDs and only a short one-way local-session correlation
+  when essential.
+- [ ] Ensure tokens, codes, cookies, state, nonce, secrets, raw provider/user
+  identifiers, claims, and protocol bodies are never message parameters.
+- [ ] Test one representative event per policy class for event ID, severity,
+  required safe fields, and forbidden sentinel secrets; do not assert prose.
+
+Completion gate: operators can follow a successful and failed flow from event
+IDs, and sentinel secrets never appear in captured logs.
+
+## 12. Prove provider-neutral behavior and finish wiring
+
+- [ ] Add Keycloak and ZITADEL contract fixtures for discovery, ID-token role
+  shapes, token refresh responses, RP-initiated logout metadata, and back-channel
+  logout tokens.
+- [ ] Verify all differences are expressed through standard discovery,
+  registration, scopes, client authentication, or claim-shape configuration.
+- [ ] Search for and remove any authority-hostname/provider-name branch and any
+  access-token parsing.
+- [ ] Keep `Program.cs` as a small composition root and preserve `/ping` unless
+  the implementation gives a concrete reason to change it.
+- [ ] Confirm the production registration checklist requires a publicly
+  reachable HTTPS back-channel URI and roles in the ID token.
+
+Completion gate: the same executable/configuration model accepts both provider
+fixture contracts and references no Keycloak/ZITADEL runtime SDK.
+
+## 13. Run the completion audit
+
+- [ ] Run `mise run format`, `mise run build`, and `mise run test` with no errors.
+- [ ] Run `docker compose config` and `docker compose build`.
+- [ ] Inspect generated certificates with OpenSSL and run the Keycloak realm
+  through its native import path.
+- [ ] Confirm unit tests start no external processes and every integration
+  fixture owns its dependencies and uses loopback-bound ephemeral test ports.
+- [ ] Confirm there are no smoke, browser end-to-end, deployment, or redundant
+  structural tests.
+- [ ] Audit every row in the acceptance map in `docs/PLAN.md` against current
+  code and test/configuration output; gather stronger evidence for any row that
+  is merely plausible.
+- [ ] Inspect `git diff` for unrelated changes, committed/generated secrets,
+  certificate artifacts, provider-specific branches, and accidental token
+  exposure.
+
+Completion gate: every acceptance-map row has authoritative evidence, every
+applicable canonical command passes, and no requested behavior remains planned
+but unimplemented.
