@@ -7,6 +7,9 @@ OpenID Connect Authorization Code Flow with PKCE. The browser must receive only
 an opaque session cookie. ID, access, and refresh tokens remain server-side in
 an `IDistributedCache`-backed session. The first cache implementation is
 process memory, but authentication code must not depend on that implementation.
+The initial deployment has one active proxy replica and deliberately volatile
+sessions: a proxy restart, deployment, or cache loss ends sessions and pending
+logins rather than attempting recovery.
 
 The implementation covers:
 
@@ -21,9 +24,9 @@ The implementation covers:
   standard OpenID Connect endpoints; and
 - focused unit and integration coverage plus flow-oriented, secret-free logs.
 
-It does not cover multiple replicas, distributed locking, return URLs, bearer
-authentication for browser APIs, frontend token storage, access-token claim
-inspection, or application authorization.
+It does not cover concurrent replicas, durable session recovery, distributed
+locking, return URLs, bearer authentication for browser APIs, frontend token
+storage, access-token claim inspection, or application authorization.
 
 ## 2. Evidence and example assessment
 
@@ -184,10 +187,12 @@ logout behavior belong in separate cohesive modules.
 - **Propagate cancellation through the complete exchange.** Lines 43-50 omit
   the request cancellation token from `PostAsync`, and line 58 omits it from
   response reading even though metadata retrieval correctly uses it.
-- **Distinguish protocol failure from unavailability.** Lines 52-55 reject the
-  principal for every non-success response. `invalid_grant` and malformed token
-  responses invalidate a session; a 5xx, timeout, or transport failure should
-  retain a still-unexpired token and permit a later retry.
+- **Make every completed refresh failure fail closed.** Lines 52-55 reject the
+  principal for every non-success response but do not ensure authoritative
+  cleanup. `invalid_grant`, malformed responses, discovery failures, IdP `5xx`
+  responses, timeouts, and transport failures all invalidate the session once
+  refresh is due. Request-aborted cancellation is propagated instead because
+  the client is gone and cleanup may no longer be reliable.
 - **Validate the complete refresh response.** `OpenIdConnectMessage` plus
   `int.Parse` (lines 58-59 and 78) does not explicitly require a nonempty access
   token, positive bounded `expires_in`, compatible token type, or a valid JSON/
@@ -212,8 +217,8 @@ logout behavior belong in separate cohesive modules.
   receives an expired cookie.
 - **Add role normalization, safe diagnostics, and explicit outcomes.** A new ID
   token needs the same role mapping as initial login. The example emits no logs
-  and exposes no distinction between not-due, refreshed, transient failure, and
-  terminal failure, making flow behavior difficult to operate or test.
+  and exposes no distinction between not-due, refreshed, invalidated, and
+  request-aborted outcomes, making flow behavior difficult to operate or test.
 
 Verdict: **adapt the orchestration, replace the implementation**. Preserve the
 cookie-validation hook, discovery/backchannel use, opaque-token treatment,
@@ -228,7 +233,7 @@ and logging in `Authentication/Refresh`.
 | --- | --- | --- |
 | Code flow with PKCE | ASP.NET Core OIDC handler configuration | Integration test observes code response type, PKCE challenge, state, nonce, and correlation behavior |
 | No tokens in frontend | `ITicketStore` session boundary and allowlisted responses | Integration test proves the cookie is an opaque reference and contains none of the known test tokens; endpoint contracts expose no token field |
-| In-memory sessions through distributed abstraction | `DistributedCacheTicketStore` plus `AddDistributedMemoryCache` composition | Store unit tests and service-registration integration test use only `IDistributedCache` |
+| Volatile in-memory sessions through distributed abstraction | `DistributedCacheTicketStore` plus `AddDistributedMemoryCache` composition | Store unit tests and service-registration integration tests use only `IDistributedCache`; loss of a cache record safely makes the cookie anonymous |
 | Pending login material in memory | `DistributedCacheStateDataFormat` | Unit tests prove random opaque state, bounded expiry, one-time consumption, and invalid/expired rejection |
 | Correlation protection | Built-in OIDC correlation and nonce cookies | Integration test proves absent/tampered correlation fails; cookie options are asserted once at the framework boundary |
 | Keycloak development IdP | Compose, certificate script, and importable realm | Native Compose rendering/build validation and an integration fixture using the imported realm configuration |
@@ -236,7 +241,7 @@ and logging in `Authentication/Refresh`.
 | Principal from ID token only | OIDC handler and ID-token principal factory used during refresh | Unit tests use an opaque, non-JWT access token and prove identity/roles come only from the signed ID token |
 | Minimal scopes | OIDC options and provider configuration | Options test proves default scopes are `openid offline_access`; any role scope is an explicit deployment override |
 | Roles consumed, no authorization | ID-token role normalizer and `/whoami` response | Unit tests cover supported role claim shapes; solution contains no role policy or role-gated endpoint |
-| Token refresh | Cookie validation event and `OidcTokenRefresher` | Unit tests cover not-due, success, rotation, optional new ID token, `invalid_grant`, transient error, and expired-token behavior |
+| Token refresh | Cookie validation event and `OidcTokenRefresher` | Unit tests cover not-due, success, rotation, optional new ID token, each completed failure class invalidating the session, and request-aborted cancellation propagation |
 | User-initiated logout | `POST /logout`, cookie sign-out, OIDC sign-out | Integration test proves local ticket removal and OIDC sign-out with fixed post-logout redirect and server-held ID-token hint |
 | Back-channel logout | Logout-token validator, session index, and endpoint | Standards-focused unit tests plus endpoint integration tests cover signature/claims/replay and `sid`/`sub` invalidation |
 | Minimal logs | Source-generated authentication log events | Tests assert representative event identity/severity/required safe fields and forbidden secrets, without pinning prose |
@@ -310,6 +315,13 @@ top-level POST (for example, a form submission) so a third-party site cannot
 trigger it with an ordinary link. The configured frontend home is a local,
 startup-validated relative path, eliminating open-redirect input.
 
+For an automatic login experience, a frontend-wide response interceptor may
+handle an API `401` by assigning `window.location` to `/login`, with loop
+prevention and exemptions for requests that should not initiate navigation.
+Returning a redirect from an API request is not a substitute: `fetch` or XHR
+follows it within that request and does not navigate the top-level document.
+Frontend implementation is outside this repository.
+
 Cookie authentication is the default authenticate and sign-in scheme. API
 challenge/forbidden events return 401/403 rather than redirecting to HTML login.
 The OIDC scheme is challenged only by `/login`.
@@ -336,8 +348,11 @@ have the `__Host-` prefix.
 Configure the OIDC handler to:
 
 - use authorization code response type and PKCE;
+- use `AuthenticationMethod=RedirectGet` so `/login` sends the browser to the
+  authorization endpoint with a temporary redirect;
 - use the standard `form_post` response mode so the authorization response is
-  not left in browser history or ordinary query logs;
+  posted independently by the IdP to the callback and is not left in browser
+  history or ordinary query logs;
 - require HTTPS metadata except in explicitly isolated tests;
 - use discovery rather than configured vendor endpoint paths;
 - leave pushed authorization requests at the ASP.NET Core interoperable
@@ -378,6 +393,11 @@ HttpOnly, host-only cookies with `Path=/` and `SameSite=None`, which is required
 for their inclusion on the selected cross-site `form_post` callback. The local
 HTTPS requirement is therefore mandatory even during development.
 
+Protecting cached transaction properties is required even though their storage
+is volatile. It prevents a cache-only reader from inspecting trusted properties
+and makes cache modification fail authentication; restart survival is a
+separate availability concern.
+
 ## 8. Server-side session design
 
 Implement `DistributedCacheTicketStore : ITicketStore` and assign it to
@@ -395,11 +415,21 @@ The store:
 - supports store, renew, retrieve, and remove with cancellation; and
 - updates the logout indexes when a ticket is created, renewed, or removed.
 
+Purpose-specific protection keeps a cache-only compromise from exposing saved
+ID, access, and refresh tokens or silently modifying trusted principal and
+ticket data. A dedicated, unpublished cache is still a high-value credential
+store and is not a substitute for confidentiality and integrity protection.
+Protection does not promise durability: with the initial ephemeral key ring,
+records from an earlier process are intentionally unreadable and expire as
+stale cache data.
+
 The cookie contains only the data-protected session-store reference generated
 by the cookie handler. Set its name to `__Host-authn-proxy`, `Secure=Always`,
 `HttpOnly=true`, `Path=/`, no Domain, and `SameSite=Lax`. Keep it a browser
 session cookie; server expiry remains authoritative. Do not expose the raw
-session ID in responses or logs.
+session ID in responses or logs. If its referenced cache record is missing or
+unreadable, authenticate as anonymous and expire the stale cookie when the
+response can still be sent.
 
 Back-channel logout cannot enumerate `IDistributedCache`, so maintain secondary
 index entries:
@@ -411,6 +441,12 @@ Hash issuer/subject/session index material before using it in cache keys. Give
 indexes no longer a lifetime than their tickets and prune stale IDs during
 lookup. Read/modify/write races are accepted by the stated single-replica,
 no-concurrency-hardening requirement. Do not add distributed locks.
+
+These indexes are retained because prompt provider-initiated, administrator,
+and global logout is a requirement. A logout token identifies sessions by
+issuer plus `sid` or `sub`, not by the random local ticket handle, so some
+equivalent lookup is unavoidable while `IDistributedCache` remains the storage
+boundary.
 
 ## 9. Principal and role handling
 
@@ -433,6 +469,12 @@ never the claim contents. ZITADEL must be configured to put user roles in the
 ID token; Keycloak must use a realm/client-scope mapper that puts the agreed
 claim in the ID token. Neither requires the proxy to understand an access-token
 format.
+
+Keep these two small cases in one normalizer selected by the validated claim
+shape option. Do not add provider-named implementations or a chain that tries
+extractors until one accepts the value. If a third materially different
+algorithm is required later, split the cases into `IRoleClaimExtractor`
+strategies and select exactly one by claim-shape configuration.
 
 ## 10. Refresh behavior
 
@@ -457,14 +499,23 @@ with a valid ticket:
 
 Failure policy:
 
-- `invalid_grant`, an invalid token response, or an invalid refreshed ID token
-  rejects and deletes the local session;
-- transient discovery/token endpoint failure retains a still-usable ticket and
-  logs a warning so a later request can retry;
-- once the access token is expired and refresh cannot make it usable, reject the
-  session and return 401; and
+- any completed unsuccessful refresh—including `invalid_grant`, invalid
+  protocol data, an invalid refreshed ID token, discovery failure, IdP `5xx`,
+  timeout, or transport failure—rejects the principal and deletes the
+  authoritative ticket and indexes;
+- expire the browser cookie when the response can still be sent and return 401;
+- propagate a request-aborted `OperationCanceledException` instead of
+  translating it into an authentication result, because the client is already
+  gone and cancellation may prevent reliable cleanup; and
 - concurrent refreshes may race, as explicitly allowed. There is no lock or
   single-flight mechanism.
+
+This deliberately trades availability for a smaller fail-closed policy. A
+brief IdP, discovery, DNS, or network outage can log out every session entering
+its refresh window, discard an access token that was still valid, and cause a
+burst of new login attempts. A frontend that immediately navigates to `/login`
+after every 401 must prevent repeated login failure from becoming a redirect
+loop. These outcomes are accepted rather than retaining a ticket for retry.
 
 The refresh service is responsible only for token lifecycle. It does not call a
 downstream API and never returns tokens through an endpoint.
@@ -505,6 +556,12 @@ matching provider session; with only `sub`, invalidate all indexed sessions for
 that issuer and subject. A valid token that matches no live local session still
 succeeds. Return 200 for success and 400 for invalid input, always with
 `Cache-Control: no-store` and without validation details that aid an attacker.
+
+Do not replace back-channel invalidation with “refresh will notice later.” The
+requested `offline_access` refresh token can remain valid after the provider
+session ends, so IdP-side logout, another relying party's logout, or an
+administrator terminating the provider session might otherwise leave the local
+session usable until its bounded local expiry.
 
 ## 12. Local TLS and Keycloak
 
@@ -572,7 +629,7 @@ IDs. Emit one representative event at these boundaries:
 - login challenge started and callback succeeded/failed;
 - session created, renewed, expired/removed (avoid logging every successful
   lookup);
-- refresh attempted, succeeded, transiently failed, or invalidated a session;
+- refresh attempted, succeeded, invalidated a session, or was request-aborted;
 - local logout started/completed; and
 - back-channel token accepted/rejected plus number of sessions invalidated.
 
@@ -602,7 +659,8 @@ Test each policy once at its lowest stable owner.
   index cleanup using an in-memory `IDistributedCache`;
 - refresh decision and failure matrix with an injected HTTP handler, fixed
   `TimeProvider`, opaque non-JWT access/refresh tokens, and locally signed ID
-  tokens;
+  tokens, proving every completed failure removes the session and request-abort
+  cancellation propagates;
 - logout-token signature and every required claim rule, replay, `sid` lookup,
   `sub` fan-out, and no-match success; and
 - representative log events for required safe fields and forbidden secrets.
@@ -611,10 +669,11 @@ Test each policy once at its lowest stable owner.
 
 - `/whoami` returns 401 without a ticket and an allowlisted identity with one;
 - cookie sign-in stores the ticket server-side, exposes only an opaque cookie,
-  and becomes invalid when the cache record is removed;
+  becomes anonymous when the cache record is removed, and clears the stale
+  browser cookie when a response can be sent;
 - `/login` invokes only the OIDC scheme, uses a fixed redirect destination, and
-  emits code/PKCE/state/nonce/correlation parameters with `form_post` response
-  mode;
+  emits code/PKCE/state/nonce/correlation parameters using `RedirectGet` for the
+  authorization request and `form_post` for the callback response mode;
 - callback POST rejection for invalid/absent correlation and successful callback
   wiring with a standards-based in-process test issuer;
 - `/logout` removes the local session and invokes RP-initiated sign-out without
@@ -650,12 +709,24 @@ prove the invariant.
 
 ## 16. Security and operational notes
 
-- Data-protection keys must be persisted and shared before adding replicas;
-  in-process ephemeral keys are acceptable only for the stated single-instance
-  development phase and cause sessions to end on restart.
-- Switching from memory cache to a remote distributed cache changes only cache
-  registration. Before doing so, revisit atomic index updates and concurrent
-  refresh behavior.
+- The initial deployment supports exactly one active proxy replica, an
+  in-process distributed-memory cache, and an ephemeral Data Protection key
+  ring. Restart, deployment, or cache loss intentionally ends local sessions,
+  pending OIDC transactions, replay records, and logout indexes. A callback
+  whose transaction disappeared fails safely and requires a new login; a stale
+  session cookie resolves as anonymous and is cleared when possible.
+- Normal idle and absolute expiry remain required security controls despite the
+  volatile store. Do not add cache recovery, cache migration, session
+  restoration, or durable key persistence for the initial implementation.
+- Before enabling concurrent replicas, introduce a shared cache and shared
+  Data Protection key ring (or prove strict affinity) and revisit atomic index
+  updates and concurrent refresh behavior. A shared cache without shared keys
+  is insufficient; users cannot repair nondeterministic cross-replica failures
+  merely by logging in again.
+- A later external cache may let records outlive the proxy, but that is not a
+  supported durability guarantee. Authentication code continues to depend only
+  on `IDistributedCache` so changing the registration does not change its
+  boundary.
 - A production back-channel URI must be reachable by ZITADEL over HTTPS. It is
   unauthenticated at HTTP level because the signed logout token authenticates
   the request.

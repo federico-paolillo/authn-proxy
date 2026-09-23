@@ -30,6 +30,9 @@ file wholesale; the plan identifies the small set of mechanisms worth adapting.
   lifetimes.
 - [ ] Register `AddDistributedMemoryCache`, data protection, and
   `TimeProvider.System` through a concern-specific authentication extension.
+- [ ] Compose the initial deployment for one active replica with process-local
+  cache and ephemeral Data Protection keys; add no session or pending-login
+  persistence or recovery options.
 - [ ] Unit-test the validation rules without repeating framework validation.
 
 Completion gate: valid configuration starts; each material unsafe or incomplete
@@ -73,7 +76,9 @@ accepts the realm. All published ports are explicitly loopback-bound.
   isolation by data-protection purpose.
 
 Completion gate: browser-visible state contains no serialized authentication
-properties and only a live server cache entry can complete the flow.
+properties and only a live server cache entry can complete the flow. Losing the
+entry or ephemeral protection key makes the callback fail safely and require a
+new login.
 
 ## 4. Implement the distributed session ticket store
 
@@ -81,7 +86,8 @@ properties and only a live server cache entry can complete the flow.
   injected `IDistributedCache`.
 - [ ] Generate opaque 256-bit session IDs, use versioned hashed cache keys,
   serialize with the framework ticket serializer, and data-protect cached
-  ticket bytes.
+  ticket bytes so cache-only read or write access cannot expose tokens or forge
+  trusted ticket data.
 - [ ] Apply bounded ticket/idle expiry and make renewal update the authoritative
   server record.
 - [ ] Add issuer+`sid` and issuer+`sub` indexes with hashed key material, bounded
@@ -93,24 +99,29 @@ properties and only a live server cache entry can complete the flow.
 
 Completion gate: an `AuthenticationTicket` containing known fake tokens round
 trips through the cache, while its corresponding cookie/reference and cache key
-contain none of those token values.
+contain none of those token values. Cache or key loss ends the session safely;
+restart survival and recovery are not implemented.
 
 ## 5. Configure cookie and OpenID Connect handlers
 
 - [ ] Configure cookie authentication as the default authenticate/sign-in
   scheme and make API challenges return 401/403 rather than login redirects.
+  Automatic login navigation remains a frontend-wide 401-interceptor concern,
+  outside this repository.
 - [ ] Set `__Host-authn-proxy`, Secure, HttpOnly, host-only, `Path=/`, and Lax
   SameSite cookie properties.
 - [ ] Configure OIDC code flow, PKCE, discovery, HTTPS metadata, saved server-side
-  tokens, `form_post` response mode, disabled UserInfo, explicit claim types,
-  and provider-neutral PAR behavior.
+  tokens, `RedirectGet` authorization requests, `form_post` callback response
+  mode, disabled UserInfo, explicit claim types, and provider-neutral PAR
+  behavior.
 - [ ] Configure Secure, HttpOnly, host-only, `SameSite=None` nonce/correlation
   cookies and retain the handler's built-in issuer, audience, signature, state,
   nonce, and correlation checks.
 - [ ] Add only `openid offline_access` by default; allow reviewed extra scopes
   through configuration.
 - [ ] Add integration coverage for registration, challenge parameters, cookie
-  flags, and tampered/absent correlation.
+  flags, tampered/absent correlation, and a stale cookie whose missing or
+  unreadable ticket authenticates as anonymous and is expired in the response.
 
 Completion gate: the framework completes a test-issuer code/PKCE callback into a
 server-side ticket, and a request without that cache record authenticates as
@@ -137,6 +148,9 @@ and all browser-facing bodies, headers, and cookies remain token-free.
   principal.
 - [ ] Normalize a configured string/string-array role claim and a configured
   object-key role claim into repeated role claims.
+- [ ] Keep both configured shapes in one normalizer; do not select by provider
+  name or try a chain of extractors. Introduce configuration-selected
+  `IRoleClaimExtractor` strategies only if a third material algorithm appears.
 - [ ] Configure the Keycloak realm to emit the simple array claim and document
   the production ZITADEL claim name/value-shape settings in application
   configuration examples.
@@ -163,15 +177,21 @@ effect on identity.
 - [ ] Validate a returned ID token with current issuer/signing/audience/lifetime
   rules before replacing the principal; retain the prior ID-token principal if
   the response legitimately omits an ID token.
-- [ ] Reject/delete on `invalid_grant`, invalid protocol data, invalid ID token,
-  or expired access token that cannot be refreshed; retain a still-usable ticket
-  on transient failure.
+- [ ] On every completed refresh failure—including `invalid_grant`, invalid
+  protocol data or ID token, discovery failure, IdP `5xx`, timeout, or transport
+  failure—reject the principal, delete the authoritative ticket and indexes,
+  expire the cookie when possible, and return 401.
+- [ ] Propagate request-aborted `OperationCanceledException` instead of
+  translating it into an authentication result; do not promise cleanup after
+  the client has gone.
 - [ ] Do not add refresh locking or single-flight behavior.
-- [ ] Unit-test the complete decision/failure matrix with fixed time, opaque
-  tokens, rotated tokens, and locally signed ID tokens.
+- [ ] Unit-test not-due, successful refresh, rotation, optional ID token, every
+  completed failure class, and request-aborted cancellation with fixed time,
+  opaque tokens, and locally signed ID tokens.
 
 Completion gate: refresh changes only the server ticket, never a browser-visible
-contract, and every session-retention/removal outcome matches the plan.
+contract. Every completed failure removes the session; only request-aborted
+cancellation bypasses the authentication outcome.
 
 ## 9. Implement user-initiated logout
 
@@ -190,6 +210,9 @@ providers receive a standards-based RP-initiated logout request with the hint.
 
 ## 10. Implement OpenID Connect back-channel logout
 
+- [ ] Retain the feature so provider, administrator, and global logout promptly
+  ends local sessions; do not assume `offline_access` refresh will observe
+  provider-session logout.
 - [ ] Add a form-only POST endpoint for `logout_token` with `Cache-Control:
   no-store` responses.
 - [ ] Validate signature/algorithm, issuer, client audience, `iat`, `exp`, `jti`,
@@ -198,7 +221,9 @@ providers receive a standards-based RP-initiated logout request with the hint.
   while rejecting `alg=none` and all invalid required claims.
 - [ ] Add hashed `(issuer,jti)` replay entries bounded by token expiry.
 - [ ] Invalidate the exact issuer+`sid` sessions, or all issuer+`sub` sessions
-  when `sid` is absent; treat no matching live session as success.
+  when `sid` is absent; use the required secondary indexes because the logout
+  token does not carry the local ticket handle, and treat no live match as
+  success.
 - [ ] Return 200 on success and 400 on invalid request without leaking validation
   details.
 - [ ] Unit-test every normative validation rule and session-selection policy;
@@ -211,7 +236,8 @@ intended server ticket(s), and invalid/replayed tokens cannot affect sessions.
 ## 11. Add flow-oriented safe logging
 
 - [ ] Define source-generated events for login, callback, session lifecycle,
-  refresh outcomes, local logout, and back-channel acceptance/rejection.
+  refresh success/invalidation/request-abort outcomes, local logout, and
+  back-channel acceptance/rejection.
 - [ ] Retain the generic host's console logging provider, use `ILogger<T>` only,
   and control verbosity through the existing `Logging` configuration.
 - [ ] Use generated flow IDs and only a short one-way local-session correlation
@@ -249,6 +275,11 @@ fixture contracts and references no Keycloak/ZITADEL runtime SDK.
   through its native import path.
 - [ ] Confirm unit tests start no external processes and every integration
   fixture owns its dependencies and uses loopback-bound ephemeral test ports.
+- [ ] Confirm restart/cache/key loss ends sessions and pending logins safely,
+  and that no durability, recovery, or concurrent-replica support was added.
+- [ ] Search the plan and implementation for stale transient-refresh retention,
+  default OIDC challenges, provider-selected role extractors, or assumptions
+  that refresh replaces back-channel logout.
 - [ ] Confirm there are no smoke, browser end-to-end, deployment, or redundant
   structural tests.
 - [ ] Audit every row in the acceptance map in `docs/PLAN.md` against current
