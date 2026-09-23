@@ -21,13 +21,17 @@ file wholesale; the plan identifies the small set of mechanisms worth adapting.
 ## 1. Establish dependencies and configuration contracts
 
 - [ ] Add the official ASP.NET Core OpenID Connect package aligned with the
-  repository's 10.0.x dependency versions; add no provider SDK.
+  repository's 10.0.x dependency versions and YARP 2.3.0; add no provider SDK.
 - [ ] Define provider-neutral options for authority/client credentials, fixed
   paths, scopes, claim mapping, client authentication method, session/refresh/
-  transaction lifetimes, and cookie settings.
+  transaction lifetimes, cookie settings, and the canonical public HTTPS origin.
+- [ ] Define the optional proxy contract with explicit enablement and routes
+  containing only an ID, inbound path prefix, HTTPS destination, and optional
+  prefix removal.
 - [ ] Implement startup validation, including production HTTPS, `__Host-`
-  cookie rules, relative local redirects, required secrets, and coherent
-  lifetimes.
+  cookie rules, relative local redirects, required secrets, coherent lifetimes,
+  exact-origin syntax, proxy enablement consistency, route uniqueness/overlap,
+  reserved paths, and trusted destination shape.
 - [ ] Register `AddDistributedMemoryCache`, data protection, and
   `TimeProvider.System` through a concern-specific authentication extension.
 - [ ] Compose the initial deployment for one active replica with process-local
@@ -117,11 +121,20 @@ restart survival and recovery are not implemented.
 - [ ] Configure Secure, HttpOnly, host-only, `SameSite=None` nonce/correlation
   cookies and retain the handler's built-in issuer, audience, signature, state,
   nonce, and correlation checks.
+- [ ] Add one origin-validation policy before local and proxy endpoints: every
+  method except `GET`, `HEAD`, and `OPTIONS` requires exactly one valid `Origin`
+  equal to the configured public origin or returns 403 before dispatch.
+- [ ] Exempt only `/signin-oidc`, `/signout-callback-oidc`, and
+  `/backchannel-logout`; keep their OIDC or signed-token protections
+  authoritative and do not add a custom CSRF header or Referer fallback.
 - [ ] Add only `openid offline_access` by default; allow reviewed extra scopes
   through configuration.
 - [ ] Add integration coverage for registration, challenge parameters, cookie
   flags, tampered/absent correlation, and a stale cookie whose missing or
   unreadable ticket authenticates as anonymous and is expired in the response.
+- [ ] Test exact/missing/opaque/malformed/mismatched origins at the centralized
+  boundary, safe-method behavior, and the three protocol exemptions without
+  duplicating their protocol-validation tests.
 
 Completion gate: the framework completes a test-issuer code/PKCE callback into a
 server-side ticket, and a request without that cache record authenticates as
@@ -142,7 +155,7 @@ anonymous.
 Completion gate: the primary flow reaches `/whoami` successfully after callback,
 and all browser-facing bodies, headers, and cookies remain token-free.
 
-## 7. Normalize ID-token roles without authorization
+## 7. Normalize ID-token roles without role authorization
 
 - [ ] Require `sub` and build identity exclusively from the validated ID-token
   principal.
@@ -193,7 +206,44 @@ Completion gate: refresh changes only the server ticket, never a browser-visible
 contract. Every completed failure removes the session; only request-aborted
 cancellation bypasses the authentication outcome.
 
-## 9. Implement user-initiated logout
+## 9. Add optional authenticated upstream proxying
+
+- [ ] Keep proxy code under an isolated API-layer `Proxying` concern with its
+  own registration and mapping extensions; authentication/session code must not
+  reference YARP.
+- [ ] When explicitly enabled, translate each validated route into one in-memory
+  YARP route, cluster, and HTTPS destination and call `MapReverseProxy()`; when
+  disabled, register and map no proxy routes.
+- [ ] Require the same fixed authenticated-session authorization policy on every
+  generated route and place authorization after authentication. Add no anonymous,
+  configurable, or role-based route policy.
+- [ ] Preserve inbound paths by default and use YARP's prefix-removal transform
+  only when the route requests it. Support all HTTP methods and no general
+  rewrite, method-policy, live-reload, affinity, or load-balancing configuration.
+- [ ] After cookie validation and any due refresh, retrieve the current saved
+  access token and replace the outbound `Authorization` header with exactly one
+  bearer value. Return 401 without contacting the upstream if the session or
+  token is unavailable.
+- [ ] Remove inbound `Cookie` before forwarding and every upstream `Set-Cookie`
+  response header. Never expose credentials or ticket properties through proxy
+  errors, transforms, or logs.
+- [ ] Preserve ordinary methods, query strings, bodies, statuses, and
+  non-credential headers. Treat upstream/network failure as a proxy failure,
+  not as session invalidation.
+- [ ] Unit-test enablement contradictions, route/destination validation, prefix
+  translation, and fixed policy assignment.
+- [ ] Integration-test disabled mapping, authentication/token rejection before
+  upstream contact, current-token forwarding, browser authorization replacement,
+  cookie stripping in both directions, preserved/stripped paths, ordinary HTTP
+  content, uniform origin enforcement, and session retention on upstream failure
+  with a task-owned loopback HTTPS upstream.
+
+Completion gate: enabled routes transparently proxy authenticated browser
+requests with the current server-held access token, while unauthenticated or
+invalid requests never contact the upstream and no browser credential crosses
+the proxy boundary.
+
+## 10. Implement user-initiated logout
 
 - [ ] Map authenticated `POST /logout`; do not add a logout GET.
 - [ ] Sign out both cookie and OIDC schemes, delete the authoritative ticket and
@@ -208,7 +258,7 @@ cancellation bypasses the authentication outcome.
 Completion gate: the prior cookie can no longer resolve a ticket, and supported
 providers receive a standards-based RP-initiated logout request with the hint.
 
-## 10. Implement OpenID Connect back-channel logout
+## 11. Implement OpenID Connect back-channel logout
 
 - [ ] Retain the feature so provider, administrator, and global logout promptly
   ends local sessions; do not assume `offline_access` refresh will observe
@@ -233,11 +283,11 @@ providers receive a standards-based RP-initiated logout request with the hint.
 Completion gate: Keycloak- and ZITADEL-shaped valid logout tokens remove the
 intended server ticket(s), and invalid/replayed tokens cannot affect sessions.
 
-## 11. Add flow-oriented safe logging
+## 12. Add flow-oriented safe logging
 
 - [ ] Define source-generated events for login, callback, session lifecycle,
   refresh success/invalidation/request-abort outcomes, local logout, and
-  back-channel acceptance/rejection.
+  back-channel acceptance/rejection, plus proxy rejection/completion/failure.
 - [ ] Retain the generic host's console logging provider, use `ILogger<T>` only,
   and control verbosity through the existing `Logging` configuration.
 - [ ] Use generated flow IDs and only a short one-way local-session correlation
@@ -250,7 +300,7 @@ intended server ticket(s), and invalid/replayed tokens cannot affect sessions.
 Completion gate: operators can follow a successful and failed flow from event
 IDs, and sentinel secrets never appear in captured logs.
 
-## 12. Prove provider-neutral behavior and finish wiring
+## 13. Prove provider-neutral behavior and finish wiring
 
 - [ ] Add Keycloak and ZITADEL contract fixtures for discovery, ID-token role
   shapes, token refresh responses, RP-initiated logout metadata, and back-channel
@@ -267,7 +317,7 @@ IDs, and sentinel secrets never appear in captured logs.
 Completion gate: the same executable/configuration model accepts both provider
 fixture contracts and references no Keycloak/ZITADEL runtime SDK.
 
-## 13. Run the completion audit
+## 14. Run the completion audit
 
 - [ ] Run `mise run format`, `mise run build`, and `mise run test` with no errors.
 - [ ] Run `docker compose config` and `docker compose build`.
@@ -280,6 +330,9 @@ fixture contracts and references no Keycloak/ZITADEL runtime SDK.
 - [ ] Search the plan and implementation for stale transient-refresh retention,
   default OIDC challenges, provider-selected role extractors, or assumptions
   that refresh replaces back-channel logout.
+- [ ] Confirm proxying cannot expose the full YARP schema, accept anonymous
+  routes or non-HTTPS destinations, forward browser credentials, bypass uniform
+  origin validation, or introduce a YARP dependency into authentication code.
 - [ ] Confirm there are no smoke, browser end-to-end, deployment, or redundant
   structural tests.
 - [ ] Audit every row in the acceptance map in `docs/PLAN.md` against current

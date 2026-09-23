@@ -18,15 +18,19 @@ The implementation covers:
 - automatic access-token refresh without parsing access or refresh tokens;
 - construction and renewal of the `ClaimsPrincipal` from validated ID tokens
   only;
-- role extraction from ID-token claims, without authorization policies;
+- role extraction from ID-token claims, without role authorization policies;
 - local HTTPS plus a reproducible Keycloak realm for development;
 - provider-neutral operation with Keycloak and ZITADEL through discovery and
-  standard OpenID Connect endpoints; and
+  standard OpenID Connect endpoints;
+- an optional authenticated YARP module that forwards the current server-held
+  access token to configured HTTPS upstreams; and
 - focused unit and integration coverage plus flow-oriented, secret-free logs.
 
 It does not cover concurrent replicas, durable session recovery, distributed
 locking, return URLs, bearer authentication for browser APIs, frontend token
-storage, access-token claim inspection, or application authorization.
+storage, access-token claim inspection, application role authorization, live
+proxy-route reload, arbitrary YARP configuration, load balancing, token
+exchange, or access tokens for multiple audiences.
 
 ## 2. Evidence and example assessment
 
@@ -240,10 +244,12 @@ and logging in `Authentication/Refresh`.
 | Keycloak and ZITADEL compatibility | Standard discovery/options plus configurable claim/token-client policies | Provider contract fixtures cover both metadata/claim shapes; no provider SDK or provider-name branch exists |
 | Principal from ID token only | OIDC handler and ID-token principal factory used during refresh | Unit tests use an opaque, non-JWT access token and prove identity/roles come only from the signed ID token |
 | Minimal scopes | OIDC options and provider configuration | Options test proves default scopes are `openid offline_access`; any role scope is an explicit deployment override |
-| Roles consumed, no authorization | ID-token role normalizer and `/whoami` response | Unit tests cover supported role claim shapes; solution contains no role policy or role-gated endpoint |
+| Roles consumed, no role authorization | ID-token role normalizer and `/whoami` response | Unit tests cover supported role claim shapes; solution contains no role policy or role-gated endpoint |
 | Token refresh | Cookie validation event and `OidcTokenRefresher` | Unit tests cover not-due, success, rotation, optional new ID token, each completed failure class invalidating the session, and request-aborted cancellation propagation |
 | User-initiated logout | `POST /logout`, cookie sign-out, OIDC sign-out | Integration test proves local ticket removal and OIDC sign-out with fixed post-logout redirect and server-held ID-token hint |
 | Back-channel logout | Logout-token validator, session index, and endpoint | Standards-focused unit tests plus endpoint integration tests cover signature/claims/replay and `sid`/`sub` invalidation |
+| Transparent authenticated upstream proxying | Isolated YARP registration, route translation, authorization policy, and transforms | Integration tests prove local and proxied requests share one browser contract, only authenticated requests reach an upstream, the current access token replaces browser credentials, cookies do not cross the boundary, and upstream failures retain the session |
+| Same-origin unsafe requests | Central origin-validation middleware | Unit and integration tests prove unsafe local and proxied requests require the configured public origin while OIDC and back-channel protocol ingress retain their protocol-specific validation |
 | Minimal logs | Source-generated authentication log events | Tests assert representative event identity/severity/required safe fields and forbidden secrets, without pinning prose |
 | Local HTTPS | OpenSSL script, Kestrel and Keycloak configuration | Certificate inspection and native container/configuration validation prove SANs, expiry, HTTPS endpoints, and loopback-only publication |
 
@@ -267,6 +273,10 @@ AuthnProxy.Api/Authentication/
   Refresh/              token request/response and cookie validation event
   Logout/               logout-token validation and session invalidation
   Diagnostics/          source-generated, secret-free log events
+AuthnProxy.Api/Proxying/
+  Configuration/       small route contract, validation, YARP translation
+  Transforms/          access-token injection and credential-boundary handling
+  Diagnostics/         source-generated, secret-free proxy events
 ```
 
 Add `InternalsVisibleTo` only where it permits focused tests of internal policy.
@@ -280,7 +290,9 @@ or the OIDC configuration manager.
 extension registers cache, data protection, option validation, session/state
 stores, refresh/logout services, cookie authentication, and OpenID Connect.
 `MapProxyAuthentication()` maps only application-owned endpoints; the OIDC
-handler continues to own callback and signed-out callback paths.
+handler continues to own callback and signed-out callback paths. Separate
+`AddProxying(configuration)` and `MapProxying()` extensions conditionally
+register and map YARP without creating an authentication-to-YARP dependency.
 
 Middleware order is:
 
@@ -288,12 +300,17 @@ Middleware order is:
 2. forwarded headers only if an explicit trusted-proxy configuration is later
    supplied (do not trust arbitrary forwarding headers);
 3. HTTPS redirection outside integration-test hosting;
-4. authentication; and
-5. application endpoints.
+4. centralized origin validation;
+5. authentication;
+6. authorization when proxying is enabled; and
+7. application and proxy endpoints.
 
-Do not add authorization middleware or policies. Endpoints that need a session
-check `HttpContext.User.Identity.IsAuthenticated` or call authentication
-explicitly and return 401.
+Every generated proxy route uses one fixed infrastructure policy requiring an
+authenticated session. The proxy configuration cannot select anonymous or
+arbitrary policies. Do not add role policies, custom authorization handlers, or
+role-gated application endpoints. Application-owned endpoints that need a
+session continue to check `HttpContext.User.Identity.IsAuthenticated` or call
+authentication explicitly and return 401.
 
 ## 5. Protocol and endpoint design
 
@@ -326,12 +343,26 @@ Cookie authentication is the default authenticate and sign-in scheme. API
 challenge/forbidden events return 401/403 rather than redirecting to HTML login.
 The OIDC scheme is challenged only by `/login`.
 
+Apply one origin policy before both application and proxy endpoints so browser
+clients do not need to know which component owns a route. For every method other
+than `GET`, `HEAD`, and `OPTIONS`, require exactly one syntactically valid
+`Origin` header whose serialized origin equals the configured `PublicOrigin`.
+Reject a missing, opaque (`null`), malformed, or mismatched origin with 403
+before invoking the endpoint or an upstream. Do not use a custom CSRF header,
+fall back to `Referer`, or add permissive CORS behavior.
+
+Exclude only protocol ingress that cannot originate at the frontend:
+`/signin-oidc`, `/signout-callback-oidc`, and `/backchannel-logout`. The OIDC
+callback remains protected by state, correlation, and nonce; back-channel logout
+remains protected by its signed logout token and replay checks. The exemption is
+owned centrally and cannot be extended through proxy-route configuration.
+
 ## 6. OIDC configuration
 
 Bind and validate one provider-neutral configuration section. It contains:
 
 - authority, client ID, client secret (external secret source only), callback
-  paths, and fixed post-login/post-logout paths;
+  paths, fixed post-login/post-logout paths, and the canonical `PublicOrigin`;
 - additional scopes, with `openid offline_access` as the default complete set;
 - configurable name and role claim names plus the generic role-value shape;
 - session absolute/idle lifetime, refresh lead time, and pending transaction
@@ -343,7 +374,9 @@ Bind and validate one provider-neutral configuration section. It contains:
 Fail startup for missing/invalid authority, secret, client ID, non-HTTPS
 production authority, absolute callback/home URLs where local paths are
 required, nonpositive/contradictory lifetimes, or a cookie name that does not
-have the `__Host-` prefix.
+have the `__Host-` prefix. `PublicOrigin` must be an absolute HTTPS origin with
+no path other than `/`, query, fragment, or user information; isolated tests may
+use an HTTP loopback origin.
 
 Configure the OIDC handler to:
 
@@ -621,7 +654,62 @@ issuer strings to choose Keycloak/ZITADEL behavior. Differences are expressed
 only through standard discovery metadata, client registration, scopes, client
 authentication method, and claim-shape configuration.
 
-## 14. Logging
+## 14. Optional authenticated upstream proxying
+
+Use YARP 2.3.0 as an isolated API-layer add-on. Bind a deliberately small
+`Proxying` configuration contract rather than exposing YARP's full configuration
+schema:
+
+- `Enabled` explicitly controls registration and endpoint mapping;
+- each route has a stable `Id`, an absolute inbound `PathPrefix`, one absolute
+  HTTPS `Destination`, and an optional `StripPrefix` flag that defaults to
+  false; and
+- `Enabled=true` requires at least one route, while `Enabled=false` requires the
+  route collection to be empty.
+
+Fail startup for duplicate IDs, duplicate or overlapping path prefixes,
+collisions with application-owned or OIDC paths, non-HTTPS destinations, or
+destination URIs containing user information, a query, or a fragment. Paths are
+startup configuration, not user input. A route accepts all HTTP methods; do not
+add a method-policy DSL or arbitrary YARP transforms.
+
+Translate each route at startup into one YARP `RouteConfig`, `ClusterConfig`,
+and destination using `LoadFromMemory`. Assign the same fixed
+authenticated-session authorization policy to every generated route and call
+`MapReverseProxy()` only when the module is enabled. `StripPrefix=false`
+preserves the complete inbound path. When true, use YARP's prefix-removal
+transform to remove exactly the configured match prefix while preserving the
+remaining path and query. Do not add a custom `IProxyConfigProvider`, runtime
+reload, affinity, or load balancing.
+
+Cookie authentication retrieves the server ticket and its validation event
+performs any due refresh before authorization and forwarding. The request
+transform authenticates with the cookie scheme, reads `access_token` from the
+resulting `AuthenticationProperties`, and sets exactly one outbound
+`Authorization: Bearer` value. A missing session or token, or a session
+invalidated during refresh, returns 401 without contacting the upstream.
+
+Treat the proxy as a credential boundary:
+
+- replace, never combine with, a browser-supplied `Authorization` header;
+- remove the inbound `Cookie` header before forwarding;
+- remove every upstream `Set-Cookie` response header; and
+- never include access tokens, cookies, ticket properties, or upstream protocol
+  bodies in transforms, errors, or logs.
+
+Forward ordinary methods, query strings, request and response bodies, statuses,
+and non-credential headers. Origin validation occurs uniformly before routing,
+so clients use the same request contract for local and proxied APIs. An upstream
+or network failure follows YARP's normal failure response and does not delete or
+reject the local session.
+
+Every destination must accept the single access token issued for the login
+session, including its audience and scopes. Additional reviewed OIDC scopes or
+provider-side audience configuration may satisfy that contract. Upstreams that
+need different tokens require a later token-exchange or multi-token design; the
+route configuration cannot manufacture or select tokens.
+
+## 15. Logging
 
 Use `Microsoft.Extensions.Logging` source-generated messages with stable event
 IDs. Emit one representative event at these boundaries:
@@ -630,8 +718,9 @@ IDs. Emit one representative event at these boundaries:
 - session created, renewed, expired/removed (avoid logging every successful
   lookup);
 - refresh attempted, succeeded, invalidated a session, or was request-aborted;
-- local logout started/completed; and
-- back-channel token accepted/rejected plus number of sessions invalidated.
+- local logout started/completed;
+- back-channel token accepted/rejected plus number of sessions invalidated; and
+- proxy request rejected before forwarding or completed/failed upstream.
 
 Use a generated flow ID and, where essential, a short one-way hash of the local
 session handle. Never log cookies, state values, nonce, authorization codes,
@@ -645,13 +734,17 @@ through the existing `Logging` settings. Application code depends only on
 `Console`, add a second logging stack, or duplicate application allowlists in
 logging infrastructure.
 
-## 15. Verification strategy
+## 16. Verification strategy
 
 Test each policy once at its lowest stable owner.
 
 ### Unit tests
 
 - option validation and fixed redirect-path rules;
+- public-origin validation, including HTTPS production requirements and
+  rejection of non-origin URI components;
+- proxy enablement invariants, IDs, path collisions/overlap, HTTPS destinations,
+  prefix translation, and fixed authorization-policy assignment;
 - role normalization for string, array, ZITADEL object-key, empty, and malformed
   ID-token claims;
 - pending-state create/consume/expiry/tamper behavior;
@@ -679,13 +772,26 @@ Test each policy once at its lowest stable owner.
 - `/logout` removes the local session and invokes RP-initiated sign-out without
   exposing the ID token;
 - back-channel form POST invalidates an indexed ticket and obeys 200/400 plus
-  `no-store` semantics; and
+  `no-store` semantics;
+- unsafe local and proxied requests accept the exact public origin and return
+  403 before dispatch for missing, opaque, malformed, or mismatched origins;
+- safe methods need no origin, while OIDC and back-channel protocol ingress
+  remain governed by their protocol-specific validation;
+- disabled proxying maps no proxy routes; unauthenticated, tokenless, and
+  refresh-invalidated requests never contact a task-owned loopback HTTPS
+  upstream;
+- authenticated proxy requests forward the current access token and ordinary
+  HTTP content, overwrite browser authorization, do not forward cookies, and do
+  not return upstream cookies;
+- preserved and stripped-prefix routes forward the expected path, and an
+  upstream failure does not invalidate the session; and
 - application service registration uses the distributed cache abstraction and
   provider-neutral OIDC implementation.
 
 Provider contract fixtures should represent Keycloak's array role claim and
 ZITADEL's project-role object claim, discovery metadata, logout token shape, and
-optional end-session behavior. Do not create browser end-to-end, smoke, or
+optional end-session behavior. The proxy fixture owns an HTTPS upstream on a
+loopback-bound ephemeral port. Do not create browser end-to-end, smoke, or
 deployment tests. Integration fixtures own any process/container they start,
 use Docker-assigned ephemeral test ports bound to `127.0.0.1`, and never require
 the development Compose stack to be running.
@@ -707,7 +813,7 @@ through Keycloak's native import/startup path in a task-owned integration
 fixture. Do not add a bespoke realm/Compose validator where native tools already
 prove the invariant.
 
-## 16. Security and operational notes
+## 17. Security and operational notes
 
 - The initial deployment supports exactly one active proxy replica, an
   in-process distributed-memory cache, and an ephemeral Data Protection key
@@ -736,12 +842,22 @@ prove the invariant.
 - Cookie clearing alone cannot revoke a copied server session reference;
   authoritative ticket deletion, expiry, and back-channel invalidation are the
   required controls.
+- `PublicOrigin` is a security boundary and must describe the browser-visible
+  proxy origin exactly. Before deploying behind another proxy, configure and
+  trust forwarding headers explicitly rather than deriving trust from arbitrary
+  client-supplied forwarding headers.
+- Proxy routes and destinations are trusted startup configuration. Do not enable
+  runtime route input or non-HTTPS destinations because the forwarded access
+  token is a bearer credential.
 
-## 17. Primary references
+## 18. Primary references
 
 - [ASP.NET Core OIDC web authentication](https://learn.microsoft.com/en-us/aspnet/core/security/authentication/configure-oidc-web-authentication?view=aspnetcore-10.0)
 - [ASP.NET Core `ITicketStore`](https://learn.microsoft.com/en-us/dotnet/api/microsoft.aspnetcore.authentication.cookies.iticketstore?view=aspnetcore-10.0)
 - [ASP.NET Core refresh-token support issue 8175](https://github.com/dotnet/aspnetcore/issues/8175)
+- [YARP configuration](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/servers/yarp/config-files?view=aspnetcore-10.0)
+- [YARP authentication and authorization](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/servers/yarp/authn-authz?view=aspnetcore-10.0)
+- [YARP transforms](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/servers/yarp/transforms?view=aspnetcore-10.0)
 - [OpenID Connect Back-Channel Logout 1.0](https://openid.net/specs/openid-connect-backchannel-1_0.html)
 - [OpenID Connect RP-Initiated Logout 1.0](https://openid.net/specs/openid-connect-rpinitiated-1_0.html)
 - [Keycloak OpenID Connect documentation](https://www.keycloak.org/securing-apps/oidc-layers)

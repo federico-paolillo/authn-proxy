@@ -320,3 +320,112 @@ abstraction, ticket store, Data Protection, and bounded expirations, but omit
 durability and recovery work. State explicitly that a restart, cache loss, or
 deployment ends sessions and in-progress logins. Revisit shared cache and key
 ring configuration only before enabling concurrent replicas.
+
+## 7. Can YARP proxy requests with the current session's access token?
+
+### Question
+
+Can an optional YARP module use a small custom configuration model to define
+upstream routes, then forward authenticated requests with the access token
+stored in the current server-side session? Can it be activated through
+`AddReverseProxy()` and generated YARP configuration without coupling the core
+authentication implementation to YARP?
+
+### Answer
+
+Yes. This is a natural extension of the planned BFF boundary. YARP can match a
+browser-facing route, authorize it before proxying, and use a custom request
+transform to replace the outbound `Authorization` header with the access token
+from the authenticated cookie ticket. The token remains in the server-side
+`AuthenticationProperties`; it is never returned to browser code.
+
+`AddReverseProxy()` is only the service-registration part. The optional module
+would also need to:
+
+- translate its validated configuration into YARP `RouteConfig` and
+  `ClusterConfig` instances, initially through `LoadFromMemory`;
+- call `MapReverseProxy()` when the module is enabled;
+- register an authenticated-session authorization policy and place
+  `UseAuthorization()` after `UseAuthentication()`; and
+- install request and response transforms that enforce the credential
+  boundary.
+
+YARP performs no authentication or authorization by default. Every generated
+token-forwarding route should therefore carry one fixed policy that requires an
+authenticated user. The custom configuration must not allow a route to select
+`anonymous` or an arbitrary policy. This is infrastructure authorization, not
+application role authorization: downstream services continue to own their
+business permissions. The plan's blanket prohibition on authorization
+middleware would need to become a narrower prohibition on role policies,
+authorization handlers, and role-gated application endpoints. See [YARP
+authentication and
+authorization](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/servers/yarp/authn-authz?view=aspnetcore-10.0).
+
+The proxy configuration should be a deliberately small application contract,
+not a renamed copy of all YARP settings. It needs only stable route identity,
+an inbound path match, a trusted HTTPS destination, and the limited path
+rewrite or HTTP-method constraints that the application actually requires.
+The module can translate those values at startup and fail startup for duplicate
+or overlapping routes, reserved authentication paths, non-HTTPS destinations,
+or invalid rewrites. Direct `LoadFromConfig` against YARP's full
+`ReverseProxy` schema would defeat the subset requirement. A custom
+`IProxyConfigProvider` is unnecessary unless live route reload later becomes a
+real requirement. YARP supports both in-memory and configuration-provider
+models, as described in its [configuration
+documentation](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/servers/yarp/config-files?view=aspnetcore-10.0).
+
+For an authenticated proxy request, cookie authentication first retrieves the
+server ticket. Its `OnValidatePrincipal` event runs the planned refresh logic,
+so a due token is refreshed before authorization and forwarding. The YARP
+request transform can then call `AuthenticateAsync` for the cookie scheme,
+read `access_token` from the resulting ticket properties, and set
+`ProxyRequest.Headers.Authorization` to `Bearer <token>`. If the session or
+token is absent, malformed, or invalidated by refresh, the request must return
+`401` without contacting the upstream. An upstream or network failure is not a
+session failure and must not delete the local ticket. The [official YARP
+authentication sample](https://github.com/dotnet/yarp/blob/v2.3.0/samples/ReverseProxy.Auth.Sample/Program.cs)
+demonstrates retrieving an authentication ticket and setting the outbound
+header in a request transform.
+
+Credential replacement must be explicit. YARP normally copies ordinary
+request headers, and its documentation specifically notes that the proxy's
+authentication cookie otherwise flows to the destination. The module must:
+
+- overwrite any browser-supplied `Authorization` header rather than forwarding
+  or combining it;
+- remove the inbound `Cookie` header before forwarding, so an upstream cannot
+  obtain or replay the proxy session reference; and
+- remove upstream `Set-Cookie` response headers, so an upstream cannot create
+  cookies in the proxy's browser origin.
+
+No transform, error, or log may expose the access token, cookie, or ticket
+properties. Destinations must come only from trusted startup configuration and
+use HTTPS because the injected token is a bearer credential. Unsafe proxied
+methods also need same-origin CSRF protection, such as a required custom
+request header, with no permissive CORS policy that would let another origin
+add it. YARP's [transform
+documentation](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/servers/yarp/transforms?view=aspnetcore-10.0)
+describes the extension point but does not supply these BFF-specific policies.
+
+One limitation should be explicit: this design forwards the one access token
+issued for the login session. Every configured upstream must accept that
+token's audience and scopes, which may require reviewed additional OIDC scopes
+or provider-side audience configuration. If different upstreams require
+different audiences, the project needs a later token-exchange or multi-token
+design; a route DSL cannot safely manufacture those tokens.
+
+Keep the add-on in an isolated API-layer `Proxying` concern with its own
+registration and mapping extensions. The authentication/session code should
+not reference YARP. The existing refresh service still does not call a
+downstream API; the separate proxy transform only consumes the valid token it
+finds in the ticket.
+
+**Recommendation for the plan:** accept YARP as an optional authenticated BFF
+add-on. Use a small validated configuration translated to in-memory YARP
+routes and clusters, require the same authenticated-session policy on every
+generated route, refresh before forwarding, replace the outbound bearer header,
+and strip cookies across both proxy directions. Add proxy-specific acceptance
+criteria and integration tests proving that unauthenticated or tokenless
+requests never reach an upstream, an authenticated request forwards the current
+token and ordinary HTTP content correctly, browser credentials are not leaked,
+and upstream failures do not invalidate the session.
